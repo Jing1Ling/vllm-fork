@@ -119,7 +119,20 @@ class VisionBuckets:
         else:
             if envvar == "":
                 if is_batch_based:
-                    multimodal_buckets = [1, 2, 4, 8]  # batch sizes for gemma3
+                    # batch sizes for gemma3
+                    # multimodal_buckets = [1, 2, 4, 8]
+
+                    # for internvl3.5
+                    # TODO: This breaks the functionality of gemma3,
+                    # needs to be fixed later.
+                    self.img_block_patch_num = 1024
+                    # i: image block num, 1 -> 15 img blocks
+                    multimodal_buckets = [
+                        self.img_block_patch_num * i for i in range(1, 16)
+                    ]
+                    # 16/32/64/128 img blocks
+                    multimodal_buckets.extend(
+                        [self.img_block_patch_num << i for i in range(4, 8)])
                 else:
                     multimodal_buckets = [
                         1600, 3136, 4096, 6400, 7744, 9216, 12544
@@ -206,9 +219,14 @@ class Singleton(type):
 
 
 def is_mm_optimized(model):
-    return 'Gemma3ForConditionalGeneration' in str(type(model.model)) \
-        if hasattr(model, 'model') else \
-        'Gemma3ForConditionalGeneration' in str(type(model))
+    mm_optimized_list = [
+        'Gemma3ForConditionalGeneration',
+        'InternVLChatModel',
+    ]
+    if isinstance(model, HpuModelAdapter):
+        return model.model.config.architectures[0] in mm_optimized_list
+    else:
+        return model.config.architectures[0] in mm_optimized_list
 
 
 def pad_flat_tensor(tensor, desired_size):
@@ -422,6 +440,11 @@ class HpuModelAdapter(torch.nn.Module):
                     self.model.audio_tower)
 
             if self.is_mm_optimized:
+                # for internvl
+                if hasattr(self.model, 'visual'):
+                    self.model.visual = htorch.hpu.wrap_in_hpu_graph(
+                        self.model.vision_model, disable_tensor_cache=True)
+                # for gemma3
                 if hasattr(self.model, 'vision_tower'):
                     self.model.vision_tower = htorch.hpu.wrap_in_hpu_graph(
                         self.model.vision_tower, disable_tensor_cache=False)
@@ -744,6 +767,20 @@ class HpuModelAdapter(torch.nn.Module):
                 # done compute the visual tokens
                 kwargs.pop('pixel_values', None)
                 kwargs.pop('image_grid_thw', None)
+                return kwargs
+            elif self.model.config.model_type == "internvl_chat":
+                multimodal_embeddings = self.model.get_multimodal_embeddings(
+                    **kwargs)
+                inputs_embeds = self.model.get_input_embeddings(
+                    kwargs['input_ids'], multimodal_embeddings).clone()
+                kwargs.update({
+                    'inputs_embeds': inputs_embeds,
+                })
+
+                # done compute the visual tokens
+                kwargs.pop('pixel_values', None)
+                kwargs.pop('image_num_patches', None)
+                kwargs.pop('image_token_id', None)
                 return kwargs
             else:
                 return self.compute_input_embeddings_for_mm_optimized(
@@ -2992,6 +3029,67 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         )
         return seq_group
 
+    def create_dummy_internvl_multi_modal_seq_group_metadata(
+            self, group_id, num_patches, sampling_params, lora_request,
+            seq_len):
+        if not hasattr(self.get_model().config, "vision_config"):
+            raise ValueError("Expect internvl model to have vision_config")
+
+        if num_patches == UNSET_IMG_ARGS:
+            # Using the largest bucket
+            num_patches = self.get_model(
+            ).vision_buckets.multimodal_buckets[-1]
+        model_config = self.get_model().config
+        vision_config = model_config.vision_config
+        downsample_ratio = model_config.downsample_ratio
+        num_channels = vision_config.num_channels
+        image_size = vision_config.image_size
+        patch_size = vision_config.patch_size
+        img_block_patch_num = (image_size // patch_size)**2
+        assert image_size % image_size == 0
+        assert num_patches % img_block_patch_num == 0, (
+            f"num_patches % image_block_patch_num should be 0, \
+                got {num_patches % img_block_patch_num}")
+        if num_patches == UNSET_IMG_ARGS:
+            # Using the largest bucket
+            num_patches = self.get_model(
+            ).vision_buckets.multimodal_buckets[-1]
+
+        num_image_tokens = int(num_patches * (downsample_ratio**2))
+        # from tokenizer_config.json of internvl2-2b,
+        # for dummy input construction
+        image_token_id = 92546
+        prompt_token_ids = [image_token_id] * min(seq_len, num_image_tokens)
+        prompt_token_ids_array = array('l', prompt_token_ids)  # noqa: F821
+        placeholders_by_modality = {
+            'image':
+            [PlaceholderRange(offset=0, length=len(prompt_token_ids))]
+        }
+        seq_data = SequenceData(prompt_token_ids_array)
+
+        pixel_values = torch.randn(num_patches // img_block_patch_num,
+                                   num_channels, image_size, image_size)
+
+        multi_modal_data = {
+            "pixel_values": pixel_values,
+            "image_num_patches":
+            torch.Tensor([num_patches // img_block_patch_num]),
+            "image_token_id": torch.tensor(image_token_id, dtype=torch.long),
+        }
+        multi_modal_data = MultiModalKwargs(multi_modal_data)
+
+        seq_group = SequenceGroupMetadata(
+            request_id=str(group_id),
+            is_prompt=True,
+            seq_data={group_id: seq_data},
+            sampling_params=sampling_params,
+            block_tables=None,
+            lora_request=lora_request[group_id] if lora_request else None,
+            multi_modal_data=multi_modal_data,
+            multi_modal_placeholders=placeholders_by_modality,
+        )
+        return seq_group
+
     def create_dummy_seq_group_metadata(self,
                                         group_id,
                                         seq_len,
@@ -3009,13 +3107,24 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         computed_block_nums = None
         if is_prompt:
             if self.is_mm_run() and img_args is not None:
-                return self.create_dummy_multi_modal_seq_group_metadata(
-                    group_id=group_id,
-                    img_args=img_args,
-                    sampling_params=sampling_params,
-                    lora_request=lora_request,
-                    seq_len=seq_len,
-                )
+                if self.get_model().config.model_type == "internvl_chat":
+                    return \
+                        self.create_dummy_internvl_multi_modal_seq_group_metadata(
+                        group_id=group_id,
+                        num_patches=img_args,
+                        sampling_params=sampling_params,
+                        lora_request=lora_request,
+                        seq_len=seq_len,
+                    )
+                else:
+                    return \
+                        self.create_dummy_multi_modal_seq_group_metadata(
+                        group_id=group_id,
+                        img_args=img_args,
+                        sampling_params=sampling_params,
+                        lora_request=lora_request,
+                        seq_len=seq_len,
+                    )
             else:
                 input_len = seq_len
                 output_len = 0
@@ -3916,7 +4025,9 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             not model_input.multi_modal_kwargs or \
             'pixel_values' not in model_input.multi_modal_kwargs:
             return None
-        if self.model_is_mrope:
+        if self.model_is_mrope \
+            or self.model.config.model_type == "internvl_chat":
+
             pixel_values_list = model_input.multi_modal_kwargs['pixel_values']
             if isinstance(pixel_values_list, torch.Tensor):
                 pixel_values_list = [pixel_values_list]
@@ -3925,9 +4036,15 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             max_bucket_size = 0
             for pixel_values in pixel_values_list:
                 assert isinstance(pixel_values, torch.Tensor)
-                curr_num_pixels = pixel_values.shape[-2]
-                bucket_size = model.vision_buckets.get_multimodal_bucket(
-                    curr_num_pixels)
+                if model.config.model_type == "internvl_chat":
+                    curr_num_patches = pixel_values.shape[
+                        0] * model.vision_buckets.img_block_patch_num
+                    bucket_size = model.vision_buckets.get_multimodal_bucket(
+                        curr_num_patches)
+                else:
+                    curr_num_pixels = pixel_values.shape[-2]
+                    bucket_size = model.vision_buckets.get_multimodal_bucket(
+                        curr_num_pixels)
                 max_bucket_size = max(max_bucket_size, bucket_size)
         else:
             max_bucket_size = self.get_model(
@@ -4209,8 +4326,8 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     if self.model_is_mrope or self.is_mm_optimized:
                         if 'pixel_values' in execute_model_kwargs and \
                                 self.is_mm_optimized:
-                            if warmup_mode and not is_pt_profiler_run:
-                                bypass_model_exec = True
+                            # if warmup_mode and not is_pt_profiler_run:
+                            #     bypass_model_exec = True
                             execute_model_kwargs[
                                     'graphed_multimodal_buckets'] = \
                                 list(self.graphed_multimodal_buckets)

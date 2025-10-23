@@ -1052,7 +1052,8 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             prefix=maybe_prefix(prefix, "vision_model"),
         )
 
-        if hasattr(config, "tie_word_embeddings") and hasattr(config.text_config, "tie_word_embeddings"):
+        if hasattr(config, "tie_word_embeddings") and hasattr(
+                config.text_config, "tie_word_embeddings"):
             config.text_config.tie_word_embeddings = config.tie_word_embeddings
 
         self.language_model = init_vllm_registered_model(
@@ -1133,8 +1134,40 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
-    def extract_feature(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        vit_embeds = self.vision_model(pixel_values=pixel_values)
+    def extract_feature(self, image_input: torch.Tensor) -> torch.Tensor:
+        pixel_values = image_input.pop("pixel_values_flat", None)
+        # TODO: check bypass_hpu_graphs
+        # patches_num = \
+        #   pixel_values.shape[0] * self.vision_buckets.img_block_patch_num
+        # bypass_hpu_graphs = image_input["bypass_hpu_graphs"] \
+        #   and self.vision_buckets.use_graph(patches_num)
+
+        # solution 1：direct forward
+        # vit_embeds = self.vision_model(pixel_values=pixel_values)
+        # # solution 2: multiple forward
+        input_block_num = pixel_values.shape[0]
+        res_list = []
+        s, t = 0, 0
+        for vision_bucket in sorted(self.vision_buckets.multimodal_buckets,
+                                    reverse=True):
+            # patches -> img blocks
+            vision_bucket = \
+                vision_bucket // self.vision_buckets.img_block_patch_num
+            while input_block_num >= vision_bucket:
+                t += vision_bucket
+                vit_embeds = self.vision_model(
+                    pixel_values=pixel_values[s:t].clone(),
+                    bypass_hpu_graphs=image_input["bypass_hpu_graphs"]
+                )  # (num_img_blocks, img_tokens+cls=1025, hiddensize=1024)
+                s = t
+                input_block_num -= vision_bucket
+                res_list.append(vit_embeds)
+                if input_block_num == 0:
+                    break
+        assert input_block_num == 0, "should all be resolved"
+        assert len(res_list) > 0
+        vit_embeds = torch.cat(res_list, dim=0)
+
         vit_embeds = vit_embeds[:, 1:, :]
 
         h = w = int(vit_embeds.shape[1]**0.5)
@@ -1187,8 +1220,10 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
         image_token_id = kwargs["image_token_id"]
         assert isinstance(image_token_id, torch.Tensor)
-        # self.img_context_token_id = image_token_id.flatten().unique().item()  # Graph mode does not support unique() op
-        self.img_context_token_id = image_token_id[0]  # Assume image_token_id is unique
+        # Graph mode does not support unique() op
+        # self.img_context_token_id = image_token_id.flatten().unique().item()
+        self.img_context_token_id = image_token_id[
+            0]  # Assume image_token_id is unique
 
         if pixel_values_flat is not None:
             if not isinstance(pixel_values_flat, (torch.Tensor, list)):
@@ -1207,6 +1242,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
                 pixel_values_flat=self._validate_pixel_values(
                     pixel_values_flat),
                 num_patches=image_num_patches,
+                bypass_hpu_graphs=kwargs.get("bypass_hpu_graphs"),
             )
 
         raise AssertionError("This line should be unreachable.")
@@ -1232,7 +1268,8 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
         video_token_id = kwargs["video_token_id"]
         assert isinstance(video_token_id, torch.Tensor)
-        self.video_context_token_id = video_token_id.flatten().unique().item()
+        # self.video_context_token_id = video_token_id.flatten().unique().item()
+        self.video_context_token_id = video_token_id[0]
 
         if pixel_values_flat_video is not None:
             if not isinstance(pixel_values_flat_video, (torch.Tensor, list)):
@@ -1246,12 +1283,12 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
             pixel_values_flat_video = flatten_bn(pixel_values_flat_video,
                                                  concat=True)
             video_num_patches = flatten_bn(video_num_patches, concat=True)
-
             return InternVLVideoPixelInputs(
                 type="pixel_values_videos",
                 pixel_values_flat=self._validate_pixel_values(
                     pixel_values_flat_video),
                 num_patches=video_num_patches,
+                bypass_hpu_graphs=kwargs.get("bypass_hpu_graphs"),
             )
 
         raise AssertionError("This line should be unreachable.")
@@ -1265,7 +1302,7 @@ class InternVLChatModel(nn.Module, SupportsMultiModal, SupportsPP,
 
         assert self.vision_model is not None
 
-        image_embeds = self.extract_feature(image_input["pixel_values_flat"])
+        image_embeds = self.extract_feature(image_input)
         return image_embeds
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
