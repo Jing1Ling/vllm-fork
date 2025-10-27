@@ -441,8 +441,9 @@ class HpuModelAdapter(torch.nn.Module):
 
             if self.is_mm_optimized:
                 # for internvl
-                if hasattr(self.model, 'visual'):
-                    self.model.visual = htorch.hpu.wrap_in_hpu_graph(
+                if hasattr(self.model, 'vision_model'):
+                    logger.info("[Multimodal] Wrapping InternVL Vision Model")
+                    self.model.vision_model = htorch.hpu.wrap_in_hpu_graph(
                         self.model.vision_model, disable_tensor_cache=True)
                 # for gemma3
                 if hasattr(self.model, 'vision_tower'):
@@ -778,7 +779,7 @@ class HpuModelAdapter(torch.nn.Module):
                 })
 
                 # done compute the visual tokens
-                kwargs.pop('pixel_values', None)
+                kwargs.pop('pixel_values_flat', None)
                 kwargs.pop('image_num_patches', None)
                 kwargs.pop('image_token_id', None)
                 return kwargs
@@ -3058,7 +3059,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         num_image_tokens = int(num_patches * (downsample_ratio**2))
         # from tokenizer_config.json of internvl2-2b,
         # for dummy input construction
-        image_token_id = 92546
+        image_token_id = DUMMY_TOKEN_ID
         prompt_token_ids = [image_token_id] * min(seq_len, num_image_tokens)
         prompt_token_ids_array = array('l', prompt_token_ids)  # noqa: F821
         placeholders_by_modality = {
@@ -3071,7 +3072,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                    num_channels, image_size, image_size)
 
         multi_modal_data = {
-            "pixel_values": pixel_values,
+            "pixel_values_flat": pixel_values,
             "image_num_patches":
             torch.Tensor([num_patches // img_block_patch_num]),
             "image_token_id": torch.tensor(image_token_id, dtype=torch.long),
@@ -4324,15 +4325,6 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
 
                 if not bypass_model_exec:
                     if self.model_is_mrope or self.is_mm_optimized:
-                        if 'pixel_values' in execute_model_kwargs and \
-                                self.is_mm_optimized:
-                            # if warmup_mode and not is_pt_profiler_run:
-                            #     bypass_model_exec = True
-                            execute_model_kwargs[
-                                    'graphed_multimodal_buckets'] = \
-                                list(self.graphed_multimodal_buckets)
-                            # set is unhasable and causes friction with
-                            # hpu graphs, hence turning it to a list
                         execute_model_kwargs = \
                             self.model.compute_input_embeddings_for_mrope_mm_optimized(
                                 warmup_mode,
