@@ -1047,8 +1047,11 @@ def FindMambaIndexForPrefill(
     mamba_dict: Dict[int, int],
     seq_id: int,
     max_concurrency: int,
+    chunked_prefill_enabled: bool,
 ):
     if len(mamba_dict) > 0:
+        if chunked_prefill_enabled and seq_id in mamba_dict.keys():
+            return mamba_dict[seq_id]
         mamba_cache_list = list(range(max_concurrency))
         diff = list(set(mamba_cache_list) - set(mamba_dict.values()))
         new_prefill_idx = diff[0]
@@ -1921,7 +1924,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 mamba_cache_bs = self.max_num_seqs + \
                     max(8, self.max_num_seqs) + self.max_num_prefill_seqs
                 mamba_prefill_index = FindMambaIndexForPrefill(
-                    self.mamba_cache_table, seq_id, mamba_cache_bs)
+                    self.mamba_cache_table, seq_id, mamba_cache_bs, self.scheduler_config.chunked_prefill_enabled)
                 mamba_prefill_indices.append(mamba_prefill_index)
 
             computed_block_nums = seq_group_metadata.computed_block_nums
@@ -2960,8 +2963,12 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         assert isinstance(decode_input_tokens, torch.Tensor)
                         assert isinstance(decode_input_positions, torch.Tensor)
                         decode_input_tokens = decode_input_tokens.flatten()
-                        decode_input_positions = decode_input_positions.flatten(
-                        )
+                        if input_tokens.shape == input_positions.shape:
+                            if decode_input_tokens.shape != decode_input_positions.shape:
+                                decode_input_positions = decode_input_positions[0].flatten()
+                            else:
+                                decode_input_positions = decode_input_positions.flatten()
+
                         input_tokens = torch.cat(
                             (input_tokens, decode_input_tokens), dim=0)
                         input_positions = torch.cat(
@@ -2972,8 +2979,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     # Ensure tensor type for static checking.
                     assert isinstance(decode_input_tokens, torch.Tensor)
                     assert isinstance(decode_input_positions, torch.Tensor)
-                    input_tokens = decode_input_tokens.flatten()
-                    input_positions = decode_input_positions.flatten()
+                    input_tokens = decode_input_tokens #.flatten()
+                    input_positions = decode_input_positions #.flatten()
                 # FIXME: We need to adjust selected_token_indices to accommodate
                 # for padding
                 paddings = []
@@ -3291,7 +3298,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             ("Warmup compatible with Qwen2vl/Gemma3 models")
         if img_args == UNSET_IMG_ARGS:
             # Using the largest bucket
-            img_args = self.get_model().vision_buckets.multimodal_buckets[-1]
+            if self.scheduler_config.chunked_prefill_enabled:
+                img_args = self.get_model().vision_buckets.multimodal_buckets[0]
+            else:
+                img_args = self.get_model().vision_buckets.multimodal_buckets[-1]
 
         if self.get_model().config.model_type == 'KeyeVL1_5' \
             or self.get_model().config.model_type == 'KeyeVL' :
@@ -3597,12 +3607,14 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             conv_dim = self.model_config.hf_config.linear_conv_kernel_dim
         else:
             conv_dim = self.model_config.hf_config.text_config.linear_conv_kernel_dim
-        bs, seq_len = inputs.input_tokens.shape
-        mamba_cache_indices = list(range(bs))
+        mamba_cache_indices = list(range(inputs.batch_size_padded))
         mamba_cache_indices = torch.tensor(mamba_cache_indices,
                                            dtype=torch.long,
                                            device='cpu')
-        if inputs.attn_metadata.is_prompt:
+        assert inputs.attn_metadata.num_prefills > 0 or inputs.attn_metadata.num_decode_tokens > 0
+        if inputs.attn_metadata.num_prefills > 0:
+            bs = inputs.attn_metadata.num_prefills
+            seq_len = inputs.attn_metadata.num_prefill_tokens
             conv_state_indices = []
             for i in range(bs):
                 conv_state_indices += list(range(i * seq_len, \
@@ -3612,12 +3624,14 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                               device='cpu')
             conv_state_indices = self.move_to_device(conv_state_indices)
             mamba_cache_prefill_indices = \
-                self.move_to_device(mamba_cache_indices)
+                self.move_to_device(mamba_cache_indices[:bs])
             inputs.attn_metadata.conv_state_indices = conv_state_indices
             inputs.attn_metadata.mamba_cache_prefill_indices = \
                 mamba_cache_prefill_indices
-        else:
-            mamba_cache_decode_indices = mamba_cache_indices.to(  # type: ignore
+        if inputs.attn_metadata.num_decode_tokens > 0:
+            bs = inputs.attn_metadata.num_decode_tokens
+            seq_len = 1
+            mamba_cache_decode_indices = mamba_cache_indices[-bs:].to(  # type: ignore
                 self.device, non_blocking=True)
             inputs.attn_metadata.mamba_cache_decode_indices = \
                 mamba_cache_decode_indices
@@ -4690,8 +4704,8 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 self.set_active_loras(model_input.lora_requests,
                                       model_input.lora_mapping)
             # Rank!=0 workers has is_prompt==None
-            if use_delayed_sampling and not model_input.is_prompt and \
-                    model_input.input_tokens.size(1) == 1:
+            if use_delayed_sampling  and \
+                    (model_input.input_tokens.ndim == 1 or model_input.input_tokens.size(1) == 1):  # and not model_input.is_prompt
                 if self.is_driver_worker:
                     model_kwargs_broadcast_data = {
                         "input_tokens": model_input.input_tokens
@@ -4715,7 +4729,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             assert attn_metadata is not None
             is_prompt = attn_metadata.is_prompt
             assert is_prompt is not None
-            batch_size = input_tokens.size(0)
+            batch_size = input_tokens.size(0) if input_tokens.ndim > 1 else 0
             seq_len = self._seq_len(attn_metadata)
             phase = 'prompt' if is_prompt else 'decode'
             if phase == 'decode':
