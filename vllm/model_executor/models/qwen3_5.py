@@ -323,31 +323,17 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         raise NotImplementedError(
             "Qwen3.5 Series dont need to fix query key value ordering"
         )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        # output: torch.Tensor,
-    ):
-        """
-        Forward pass with three parts:
-        1. Input projection
-        2. Core attention (custom op)
-        3. Output projection
-        """
-        forward_context = get_forward_context()
-        attn_metadata: AttentionMetadata = forward_context.attn_metadata
-        conv_state = self.conv_state
-        ssm_state = self.ssm_state
-        num_prefills = attn_metadata.num_prefills
-        num_prefill_tokens = attn_metadata.num_prefill_tokens
-        num_decode_tokens = attn_metadata.num_decode_tokens
-
+    
+    def adapt_gdn_inputs(self, hidden_states, attn_metadata):
+        # 1) 统一 hidden_states 到 3D
         if attn_metadata.chunk_prefill_enabled and hidden_states.ndim == 2:
             hidden_states = hidden_states.unsqueeze(0)
 
+        assert hidden_states.ndim == 3, f"unexpected hidden_states shape: {hidden_states.shape}"
+
+        # 2) 
         # ============================================================
-        # Part 1: Input Projection
+        #  Input Projection
         # ============================================================
         mixed_qkv, _ = self.in_proj_qkv(hidden_states)
         z, _ = self.in_proj_z(hidden_states)
@@ -363,13 +349,115 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
+        prefill_part = None
+        decode_part = None
+
+        num_prefills = attn_metadata.num_prefills
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+        num_decode_tokens = attn_metadata.num_decode_tokens
+
+        # 3) prefill part
+        if num_prefills > 0 and num_prefill_tokens > 0:
+            prefill_idx = attn_metadata.mamba_cache_prefill_indices
+
+            if attn_metadata.chunk_prefill_enabled:
+                # packed layout: [1, total_tokens, h]
+                assert mixed_qkv.shape[0] == 1
+                assert num_prefill_tokens % num_prefills == 0
+
+                prefill_seq_len = num_prefill_tokens // num_prefills
+                prefill_mixed_qkv = mixed_qkv[:, :num_prefill_tokens, :].reshape(num_prefills, prefill_seq_len, -1)
+                prefill_z = z[:, :num_prefill_tokens, :].reshape(num_prefills, prefill_seq_len, -1)
+                prefill_beta = beta[:, :num_prefill_tokens, :].reshape(num_prefills, prefill_seq_len, -1)
+                prefill_g = g[:, :num_prefill_tokens, :].reshape(num_prefills, prefill_seq_len, -1)
+            else:
+                # regular layout: [bs, seq_len, h]
+                prefill_mixed_qkv = mixed_qkv
+                prefill_z = z
+                prefill_beta = beta
+                prefill_g = g
+                prefill_seq_len = mixed_qkv.shape[1]
+
+            prev_conv_state = torch.index_select(self.conv_state, 0, prefill_idx)
+            prev_ssm_state = torch.index_select(self.ssm_state, 0, prefill_idx)
+
+            # first chunk -> 置 0
+            context_lens = attn_metadata.context_lens_tensor[:num_prefills]
+            is_first_chunk = (context_lens == 0)
+            if torch.any(is_first_chunk):
+                prev_conv_state = prev_conv_state.clone()
+                prev_ssm_state = prev_ssm_state.clone()
+                prev_conv_state[is_first_chunk] = 0
+                prev_ssm_state[is_first_chunk] = 0
+
+            prefill_part = {
+                "mixed_qkv": prefill_mixed_qkv,
+                "z": prefill_z,
+                "beta": prefill_beta,
+                "g": prefill_g,
+                "bs": prefill_mixed_qkv.shape[0],
+                "seq_len": prefill_seq_len,
+                "cache_indices": prefill_idx,
+                "prev_conv_state": prev_conv_state,
+                "prev_ssm_state": prev_ssm_state,
+                "is_first_chunk": is_first_chunk,
+            }
+
+        # 4) decode part
+        if num_decode_tokens > 0:
+            decode_idx = attn_metadata.mamba_cache_decode_indices
+
+            if attn_metadata.chunk_prefill_enabled:
+                # packed layout: decode 在后半段
+                decode_mixed_qkv = mixed_qkv[:, num_prefill_tokens:, :].reshape(num_decode_tokens, 1, -1)
+                decode_z = z[:, num_prefill_tokens:, :].reshape(num_decode_tokens, 1, -1)
+                decode_beta = beta[:, num_prefill_tokens:, :].reshape(num_decode_tokens, 1, -1)
+                decode_g = g[:, num_prefill_tokens:, :].reshape(num_decode_tokens, 1, -1)
+            else:
+                # 普通 decode 一般已经是 [bs,1,h]
+                decode_mixed_qkv = mixed_qkv
+                decode_z = z
+                decode_beta = beta
+                decode_g = g
+                assert decode_mixed_qkv.shape[1] == 1, f"decode seq_len should be 1, got {decode_mixed_qkv.shape}"
+
+            prev_conv_state = torch.index_select(self.conv_state, 0, decode_idx)
+            prev_ssm_state = torch.index_select(self.ssm_state, 0, decode_idx)
+
+            decode_part = {
+                "mixed_qkv": decode_mixed_qkv,
+                "z": decode_z,
+                "beta": decode_beta,
+                "g": decode_g,
+                "bs": decode_mixed_qkv.shape[0],
+                "seq_len": 1,
+                "cache_indices": decode_idx,
+                "prev_conv_state": prev_conv_state,
+                "prev_ssm_state": prev_ssm_state,
+            }
+
+        return prefill_part, decode_part, z
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        # output: torch.Tensor,
+    ):
+        """
+        Forward pass with three parts:
+        1. Input projection
+        2. Core attention (custom op)
+        3. Output projection
+        """
+        forward_context = get_forward_context()
+        attn_metadata: AttentionMetadata = forward_context.attn_metadata
+        prefill_part, decode_part, z = self.adapt_gdn_inputs(hidden_states, attn_metadata)
+
         # ============================================================
         # Part 2: Core Attention (Custom Op)
         # ============================================================
         # Note: we should not use torch.empty here like other attention backends,
         # see discussions in https://github.com/vllm-project/vllm/pull/28182
-        mamba_cache_prefill_indices = attn_metadata.mamba_cache_prefill_indices
-        mamba_cache_decode_indices = attn_metadata.mamba_cache_decode_indices
 
         if self.conv1d_weight is None:
             self.conv1d_weight = self.conv1d.weight.squeeze(1).transpose(
@@ -377,43 +465,24 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                                         self.conv_dim // self.tp_size).float()
             del self.conv1d.weight
 
-        # if attn_metadata.chunk_prefill_enabled and num_prefill_tokens > 0:
-        #     prefill_mixed_qkv = mixed_qkv[:, :num_prefill_tokens].reshape(num_prefills, -1, mixed_qkv.shape[-1])
-        #     decode_mixed_qkv = mixed_qkv[:, num_prefill_tokens:].reshape(-1,1,mixed_qkv.shape[-1])
-        # else:
-        #     prefill_mixed_qkv = mixed_qkv
-        #     decode_mixed_qkv = mixed_qkv
         core_attn_out = None
-        if attn_metadata.is_prompt:
-            bs, seq_len, qkv_dim = mixed_qkv.shape
-            conv_state_indices = attn_metadata.conv_state_indices
-            # is_first_chunk = attn_metadata.context_len_tensor[:num_prefills].
-            # 找出prefill seqs末尾状态
-            initial_state = None
-            if attn_metadata.chunk_prefill_enabled:
-                # seq_len == chunk_size, find idx of actual tail token in current chunk
-                conv_state_indices = conv_state_indices % seq_len
-                initial_state = torch.index_select(
-                    ssm_state,
-                    dim=0,
-                    index=mamba_cache_prefill_indices,
-                )
+        if prefill_part is not None:
+            qkv_dim = prefill_part["mixed_qkv"].shape[-1]
             prefill_conv_state = torch.index_select(
-                mixed_qkv.reshape(-1, qkv_dim),
+                prefill_part["mixed_qkv"].reshape(-1, qkv_dim),
                 dim=0,
-                index=conv_state_indices).reshape(-1, self.conv_kernel_size - 1, qkv_dim)
-            mixed_qkv_with_pad = F.pad(mixed_qkv,
+                index=attn_metadata.conv_state_indices).reshape(-1, self.conv_kernel_size - 1, qkv_dim)
+            mixed_qkv_with_pad = F.pad(prefill_part["mixed_qkv"],
                                     (0, 0, self.conv_kernel_size - 1, 0))
-            # 读旧值，first chunk下为0
-            if attn_metadata.chunk_prefill_enabled and attn_metadata.conv_state_indices[-1] > seq_len:  # read previous value from 2nd chunk
-                mixed_qkv_with_pad[:,:self.conv_kernel_size - 1,:] = conv_state[mamba_cache_prefill_indices]
+
+            mixed_qkv_with_pad[:,:self.conv_kernel_size - 1,:] = prefill_part["prev_conv_state"]
             
             # 更新进state
-            conv_state.index_copy_(dim=0,
-                                index=mamba_cache_prefill_indices,
+            self.conv_state.index_copy_(dim=0,
+                                index=prefill_part["cache_indices"],
                                 source=prefill_conv_state)
             for idx in range(self.conv_kernel_size):
-                qkv_slice = mixed_qkv_with_pad[:, idx:(idx + seq_len), :]
+                qkv_slice = mixed_qkv_with_pad[:, idx:(idx + prefill_part["seq_len"]), :]
                 conv1d_weight_slice = self.conv1d_weight[idx]
                 qkv_conv = qkv_slice * conv1d_weight_slice
                 if idx == 0:
@@ -439,43 +508,40 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             value_non_spec = value.reshape(value.shape[0], value.shape[1], -1,
                                         self.head_v_dim)
 
-
-            # prefill_beta = beta[:, :num_prefill_tokens].reshape(num_prefills, -1, beta.shape[-1])
-            # prefill_g = g[:, :num_prefill_tokens].reshape(num_prefills, -1, g.shape[-1])
             if self.num_v_heads // self.num_k_heads > 1:
                 query_non_spec = query_non_spec.repeat_interleave(
                     self.num_v_heads // self.num_k_heads, dim=2)
                 key_non_spec = key_non_spec.repeat_interleave(self.num_v_heads //
                                                             self.num_k_heads,
                                                             dim=2)
-            core_attn_out, last_recurrent_state = (
+            prefill_core_attn_out, last_recurrent_state = (
                 torch_chunk_gated_delta_rule(
                     query_non_spec,
                     key_non_spec,
                     value_non_spec,
-                    g=g,
-                    beta=beta,
+                    g=prefill_part["g"],
+                    beta=prefill_part["beta"],
                     eye_constant=self.eye_constant,
                     chunk_size=self.chunk_size,
-                    initial_state=initial_state,
+                    initial_state=prefill_part["prev_ssm_state"],
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,
                 ))
-            # if core_attn_out is None:
-            #     core_attn_out = prefill_core_attn_out.reshape(-1, prefill_core_attn_out.shape[-1])
-            ssm_state.index_copy_(dim=0,
-                                index=mamba_cache_prefill_indices,
+            if core_attn_out is None:
+                core_attn_out = prefill_core_attn_out.reshape(-1, prefill_core_attn_out.shape[-1])
+            self.ssm_state.index_copy_(dim=0,
+                                index=prefill_part["cache_indices"],
                                 source=last_recurrent_state)    
-        if num_decode_tokens > 0:
+        if decode_part is not None:
             decode_mixed_qkv_non_spec, cur_conv_state = causal_conv1d_update(
-                mixed_qkv,
-                conv_state,
+                decode_part["mixed_qkv"],
+                decode_part["prev_conv_state"],
                 self.conv1d_weight,
                 self.conv1d.bias,
                 self.activation,
-                conv_state_indices=mamba_cache_decode_indices,
+                conv_state_indices=decode_part["cache_indices"],
             )
-            conv_state.index_copy_(0, mamba_cache_decode_indices,
+            self.conv_state.index_copy_(0, decode_part["cache_indices"],
                                    cur_conv_state)
 
 
@@ -496,8 +562,6 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                                         self.head_v_dim)
 
 
-            # decode_beta = beta[:, num_prefill_tokens:].reshape(-1, 1, beta.shape[-1])
-            # decode_g = g[:, num_prefill_tokens:].reshape(-1, 1, g.shape[-1])
             if self.num_v_heads // self.num_k_heads > 1:
                 query_non_spec = query_non_spec.repeat_interleave(
                     self.num_v_heads // self.num_k_heads, dim=2)
@@ -506,29 +570,29 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                                                             dim=2)
 
 
-            recurrent_state = torch.index_select(
-                ssm_state,
-                dim=0,
-                index=mamba_cache_decode_indices,
-            )
-            core_attn_out, last_recurrent_state = (
+            # recurrent_state = torch.index_select(
+            #     self.ssm_state,
+            #     dim=0,
+            #     index=decode_part["cache_indices"],
+            # )
+            decode_core_attn_out, last_recurrent_state = (
                 torch_recurrent_gated_delta_rule(
                     query_non_spec,
                     key_non_spec,
                     value_non_spec,
-                    g=g,
-                    beta=beta,
-                    recurrent_state=recurrent_state,
+                    g=decode_part["g"],
+                    beta=decode_part["beta"],
+                    recurrent_state=decode_part["prev_ssm_state"],
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,
                 ))
-            # if core_attn_out is None:
-            #     core_attn_out = decode_core_attn_out.reshape(-1, decode_core_attn_out.shape[-1])
-            # else:
-            #     core_attn_out = torch.cat([core_attn_out, decode_core_attn_out.reshape(-1, decode_core_attn_out.shape[-1])], dim=0)
-            ssm_state.index_copy_(
+            if core_attn_out is None:
+                core_attn_out = decode_core_attn_out.reshape(-1, decode_core_attn_out.shape[-1])
+            else:
+                core_attn_out = torch.cat([core_attn_out, decode_core_attn_out.reshape(-1, decode_core_attn_out.shape[-1])], dim=0)
+            self.ssm_state.index_copy_(
                 dim=0,
-                index=mamba_cache_decode_indices,
+                index=decode_part["cache_indices"],
                 source=last_recurrent_state,
             )
 
@@ -537,7 +601,6 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         z_shape_og = z.shape
         # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z).to(hidden_states.dtype)
         core_attn_out = core_attn_out.reshape(z_shape_og)

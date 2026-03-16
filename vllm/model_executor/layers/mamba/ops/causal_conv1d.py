@@ -64,7 +64,7 @@ def causal_conv1d_fn(x: torch.Tensor,
 
 
 def causal_conv1d_update(x: torch.Tensor,
-                         conv_state: torch.Tensor,
+                         prev_conv_state: torch.Tensor,
                          weight: torch.Tensor,
                          bias: Optional[torch.Tensor] = None,
                          activation: Optional[str] = None,
@@ -92,9 +92,9 @@ def causal_conv1d_update(x: torch.Tensor,
             indices 0 and 3
     out: (batch, dim) or (batch, seq, dim)
     """
-    prev_conv_state = torch.index_select(conv_state,
-                                         dim=0,
-                                         index=conv_state_indices)
+    # prev_conv_state = torch.index_select(conv_state,
+    #                                      dim=0,
+    #                                      index=conv_state_indices)
     new_conv_state = torch.concat([prev_conv_state, x], dim=1)
 
     output = (new_conv_state * weight.unsqueeze(0)).sum(dim=1)
