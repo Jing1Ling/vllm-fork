@@ -508,7 +508,8 @@ class SamplingTensors:
                         seq_data = seq_group.seq_data[seq_id]
                         prompt_tokens.append(seq_data.prompt_token_ids_array)
                         output_tokens.append(seq_data.output_token_ids_array)
-
+        if do_top_p_top_k and len(top_ks) == 0:
+            do_top_p_top_k = False
         top_k_scalar = top_ks[0] if do_top_p_top_k and all(
             k == top_ks[0] for k in top_ks) else None
         top_p_scalar = top_ps[0] if do_top_p_top_k and all(
