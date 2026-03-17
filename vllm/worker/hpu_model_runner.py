@@ -1069,7 +1069,7 @@ def FindMambaIndexForDecode(
     diff = list(set(mamba_dict.keys()) - set(seq_list))
     for idx in diff:
         mamba_dict.pop(idx)
-    return list(mamba_dict.values())
+    return [mamba_dict[seq_id] for seq_id in seq_list]
 
 
 @dataclasses.dataclass(frozen=True)
