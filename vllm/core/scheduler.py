@@ -1655,6 +1655,7 @@ class Scheduler:
                 swapped_in.infeasible_seq_groups,
                 num_lookahead_slots=num_lookahead_slots,
                 running_queue_size=len(self.running),
+                running_queue_list=[int(r.request_id) for r in self.running],
                 preempted=preempted,
             )
         # -------- End prefill-only microbatch path --------
@@ -1747,6 +1748,7 @@ class Scheduler:
             swapped_in.infeasible_seq_groups,
             num_lookahead_slots=num_lookahead_slots,
             running_queue_size=len(self.running),
+            running_queue_list=[int(r.request_id) for r in self.running],
             preempted=(len(running_scheduled.preempted) +
                        len(running_scheduled.swapped_out)),
         )
