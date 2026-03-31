@@ -130,6 +130,18 @@ class Qwen3_5MoeProcessingInfo(Qwen3VLProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config(Qwen3_5MoeConfig)
 
+@torch._dynamo.disable
+def _save_state(core_attn_out, final_state, ssm_state, state_indices):
+    """Persist GDN final_state into ssm_state cache for chunked prefill.
+
+    Must be @torch._dynamo.disable because HPU torch.compile silently
+    drops in-place index_copy_ to aliased state tensors.  Returns
+    core_attn_out as a pass-through so the compiled graph consumes
+    the call — HPU drops dynamo-disabled calls whose results are unused.
+    """
+    safe_si = torch.remainder(state_indices, ssm_state.shape[0]).long()
+    ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
+    return core_attn_out
 
 class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
     def __init__(
@@ -273,8 +285,8 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
 
         # 3) decode part
         if num_decode_tokens > 0:
-            if not( num_prefills==0 and num_prefill_tokens==0):
-                print("###mixed case in adapt_gdn_inputs, num_prefills:", num_prefills, "num_prefill_tokens:", num_prefill_tokens, "num_decode_tokens:", num_decode_tokens)
+            # if not( num_prefills==0 and num_prefill_tokens==0):
+            #     print("###mixed case in adapt_gdn_inputs, num_prefills:", num_prefills, "num_prefill_tokens:", num_prefill_tokens, "num_decode_tokens:", num_decode_tokens)
             decode_idx = attn_metadata.mamba_cache_decode_indices
 
             decode_mixed_qkv = mixed_qkv[:, num_prefill_tokens:, :].reshape(num_decode_tokens, 1, -1)
@@ -330,9 +342,11 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             mixed_qkv_with_pad[:,:self.conv_kernel_size - 1,:] = prefill_part["prev_conv_state"]
 
             # update conv_state
-            self.conv_state.index_copy_(dim=0,
-                                index=prefill_part["cache_indices"],
-                                source=prefill_conv_state)
+            # pass-through mixed_qkv_with_pad to _save_state to ensure the in-place update is not dropped by HPU torch.compile
+            mixed_qkv_with_pad =_save_state(mixed_qkv_with_pad, prefill_conv_state, self.conv_state, prefill_part["cache_indices"])
+            # self.conv_state.index_copy_(dim=0,
+            #                     index=prefill_part["cache_indices"],
+            #                     source=prefill_conv_state)
 
             for idx in range(self.conv_kernel_size):
                 qkv_slice = mixed_qkv_with_pad[:, idx:(idx + prefill_part["seq_len"]), :]
@@ -376,6 +390,7 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                     beta=prefill_part["beta"],
                     eye_constant=self.eye_constant,
                     chunk_size=self.chunk_size,
+                    inv_loop=self.inv_loop,
                     initial_state=prefill_part["prev_ssm_state"],
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,
@@ -383,9 +398,10 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             if core_attn_out is None:
                 core_attn_out = prefill_core_attn_out.reshape(-1, prefill_core_attn_out.shape[-1])
             # update ssm_state
-            self.ssm_state.index_copy_(dim=0,
-                                index=prefill_part["cache_indices"],
-                                source=last_recurrent_state)
+            core_attn_out =_save_state(core_attn_out, last_recurrent_state, self.ssm_state, prefill_part["cache_indices"])
+            # self.ssm_state.index_copy_(dim=0,
+            #                     index=prefill_part["cache_indices"],
+            #                     source=last_recurrent_state)
 
         if decode_part is not None:
             decode_mixed_qkv_non_spec, cur_conv_state = causal_conv1d_update(
@@ -396,9 +412,10 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                 self.activation,
                 conv_state_indices=decode_part["cache_indices"],
             )
-
-            self.conv_state.index_copy_(0, decode_part["cache_indices"],
-                                   cur_conv_state)
+            
+            decode_mixed_qkv_non_spec =_save_state(decode_mixed_qkv_non_spec, cur_conv_state, self.conv_state, decode_part["cache_indices"])
+            # self.conv_state.index_copy_(0, decode_part["cache_indices"],
+            #                        cur_conv_state)
 
 
             query, key, value = torch.split(
@@ -440,11 +457,12 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
                 core_attn_out = decode_core_attn_out.reshape(-1, decode_core_attn_out.shape[-1])
             else:
                 core_attn_out = torch.cat([core_attn_out, decode_core_attn_out.reshape(-1, decode_core_attn_out.shape[-1])], dim=0)
-            self.ssm_state.index_copy_(
-                dim=0,
-                index=decode_part["cache_indices"],
-                source=last_recurrent_state,
-            )
+            core_attn_out =_save_state(core_attn_out, last_recurrent_state, self.ssm_state, decode_part["cache_indices"])
+            # self.ssm_state.index_copy_(
+            #     dim=0,
+            #     index=decode_part["cache_indices"],
+            #     source=last_recurrent_state,
+            # )
 
         # Output Projection
         z_shape_og = z.shape
@@ -481,8 +499,6 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
         conv_state = self.conv_state
         ssm_state = self.ssm_state
 
-        if attn_metadata.is_prompt:
-            hidden_states = hidden_states.reshape((len(attn_metadata.context_lens_tensor)),-1,hidden_states.shape[-1])
         num_tokens = hidden_states.size(0)
 
         # ============================================================
@@ -520,7 +536,7 @@ class Qwen3_5GatedDeltaNet(Qwen3NextGatedDeltaNet):
             prefill_conv_state = torch.index_select(
                 mixed_qkv.reshape(-1, qkv_dim),
                 dim=0,
-                index=conv_state_indices).reshape(-1, self.conv_kernel_size - 1, qkv_dim)
+                index=conv_state_indices).reshape(bs, -1, qkv_dim)
             conv_state.index_copy_(dim=0,
                                    index=mamba_cache_prefill_indices,
                                    source=prefill_conv_state)
@@ -1169,9 +1185,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
 
         if intermediate_tensors is not None:
             inputs_embeds = None
-        input = input_ids if input_ids is not None else inputs_embeds
-        if input.shape[0]*input.shape[1] < positions.shape[-1]:
-            positions = positions.reshape(3,-1)
+        # seq_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[-2]
+        # print(f"##################seq_len={seq_len},inputs_embeds={inputs_embeds},positions={positions}##################")
+        # if positions.ndim == 1 and positions.shape[0] == seq_len*3:  # recover flattened position
+        #     positions = positions.reshape(3,-1)
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
